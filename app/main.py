@@ -7,50 +7,35 @@ import os
 
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, List
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from passlib.context import CryptContext
-from pydantic import BaseModel
+
+from app.crud import add_new_user, get_loans, get_user, add_loans, delete_loan, update_loan
+from app.database import create_db_and_tables
+from app.models import Token, TokenData, User, UserInDB
+from app.schema import DBUser, DBLoan
+from app.security import verify_password
 
 load_dotenv()
+
+# Create the database
+create_db_and_tables()
 
 # created using:
 # openssl rand -hex 32
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES")
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-
-class TokenData(BaseModel):
-    username: str | None = None
-
-
-class User(BaseModel):
-    username: str
-    email: str | None = None
-    disabled: bool | None = None
-
-
-class UserInDB(User):
-    hashed_password: str
-
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES"))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI()
 
-origins = ["http://localhost", "http://localhost:5173"]
+origins = ["http://localhost", "http://localhost:5173", "http://localhost:5174"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,55 +47,22 @@ app.add_middleware(
 
 
 def get_users_db():
-    with open('./database/db.json', 'r') as file:
+    with open('../database/db.json', 'r') as file:
         db = json.load(file)
         return db
 
-
-def verify_password(plain_password, hashed_password):
-    # compare password against existing hash
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password):
-    # return a hash of the plain password
-    return pwd_context.hash(password)
+#
+# def get_user(db, username: str):
+#     if username in db:
+#         user_dict = db[username]
+#         return UserInDB(**user_dict)
 
 
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
-
-
-def add_new_user(db: dict, username: str, email: str, password: str):
-    if get_user(db, username):
-        raise HTTPException(status_code=409, detail="User already exists")
-    hashed_pass = get_password_hash(password)
-    user = UserInDB(username=username, email=email, hashed_password=hashed_pass, disabled=False)
-    db.update({user.username: user})
-    # Step 1: Read existing JSON data from file
-    with open('./database/db.json', 'r') as file:
-        existing_data = json.load(file)
-
-    # Step 2: Add new entries to Python object
-    new_entry = {user.username: user.model_dump()}
-    existing_data.update(new_entry)
-
-    # Step 3: Convert Python object back to JSON
-    updated_data = json.dumps(existing_data, indent=4)
-
-    # Step 4: Write updated JSON data back to file
-    with open('./database/db.json', 'w') as file:
-        file.write(updated_data)
-    return user
-
-
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
+def authenticate_user(username: str, password: str):
+    user = get_user(username)
     if not user:
         return False
-    if not verify_password(password, user.hashed_password):
+    if not verify_password(password, user.password):
         return False
     return user
 
@@ -140,8 +92,7 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    db = get_users_db()
-    user = get_user(db, username=token_data.username)
+    user = get_user(username=token_data.username)
     if user is None:
         raise credentials_exception
     return user
@@ -150,18 +101,22 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
 async def get_current_active_user(
     current_user: Annotated[User, Depends(get_current_user)]
 ):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
+    # if current_user.disabled:
+    #     raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
+
+
+async def get_current_role_user(
+        current_user: Annotated[User, Depends(get_current_user)]
+):
+    return current_user.role
 
 
 @app.post("/token")
 async def login_for_access_token(
         form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
 ) -> Token:
-    print(form_data.__dict__)
-    db = get_users_db()
-    user = authenticate_user(db, form_data.username, form_data.password)
+    user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -170,7 +125,7 @@ async def login_for_access_token(
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     # create an access token with just the username.
-    # the user has already been authenticate
+    # the user has already been authenticated
     # above so there is no need to encode their password in the jwt.
     # only the username is needed.
     access_token = create_access_token(
@@ -191,12 +146,37 @@ async def register_user(
         username: Annotated[str, Form()],
         email: Annotated[str, Form()],
         password: Annotated[str, Form()]
-) -> UserInDB:
-    db = get_users_db()
-    user = add_new_user(db, username, email, password)
+) -> DBUser:
+    user = add_new_user(username, email, password)
     # user = add_new_user(db, form_data.username, form_data.password)
+    return get_user(username)
 
-    return user
+
+@app.get("/loans/get")
+async def loans_get(current_user: Annotated[DBUser, Depends(get_current_active_user)]):
+    loans = get_loans(current_user.id)
+    return loans
+
+
+@app.post("/loans/create")
+async def loans_add(loans: List[DBLoan], current_user: Annotated[DBUser, Depends(get_current_active_user)]):
+    # get current user and user_id
+    user_id = current_user.id
+
+    # add loans to db with userid set to that value
+    add_loans(loans, user_id)
+    return get_loans(user_id)
+
+@app.delete("/loans/deleteone")
+async def loans_deleteone(loan_id: int, current_user: Annotated[DBUser, Depends(get_current_active_user)]):
+    delete_loan(loan_id, current_user.id)
+    return get_loans(current_user.id)
+
+
+@app.put("/loans/updateone")
+async def loans_updateone(loan: DBLoan, current_user: Annotated[DBUser, Depends(get_current_active_user)]):
+    updated_loan = update_loan(loan, current_user.id)
+    return updated_loan
 
 
 # FUNCTIONS
